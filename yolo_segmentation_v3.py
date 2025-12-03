@@ -186,14 +186,14 @@ class YoloPeopleProximityNode:
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
 
         # Camera frame to use for transforms (can also just read from rgb_msg.header.frame_id)
-        self.camera_frame = rospy.get_param("~camera_frame", "zed2i_left_camera_frame")
+        self.camera_frame = rospy.get_param("~camera_frame", "zed2i_left_camera_optical_frame")
         self.base_frame   = rospy.get_param("~base_frame", "base_link")
-        self.marker_frame = rospy.get_param("~marker_frame", "base_link")
+        self.marker_frame = rospy.get_param("~marker_frame", self.base_frame)
 
         self.marker_pub = rospy.Publisher("~people_markers", MarkerArray, queue_size=1)
 
         # FOV visualization (for RViz only)
-        self.fov_angle_deg = rospy.get_param("~fov_angle_deg", 70.0)  # total horizontal FOV
+        self.fov_angle_deg = rospy.get_param("~fov_angle_deg", 85.0)  # total horizontal FOV
         self.fov_range     = rospy.get_param("~fov_range", 5.0)       # how far to draw the FOV rays (m)
 
         # --- camera intrinsics (px) ---
@@ -529,6 +529,7 @@ class YoloPeopleProximityNode:
         # ──────────────────────────────
         # 4) FOV wedge (simple two rays)
         # ──────────────────────────────
+        # 4) FOV wedge (simple two rays, aligned with actual axes)
         fov = Marker()
         fov.header.stamp = stamp
         fov.header.frame_id = self.marker_frame
@@ -539,32 +540,52 @@ class YoloPeopleProximityNode:
 
         fov.points = []
 
-        # Half-angle in radians
+        # Interpret the plane based on observed behavior:
+        #   - forward ≈ negative y
+        #   - left    ≈ positive x
+        # We'll build the wedge around that forward direction.
         half_angle_rad = math.radians(self.fov_angle_deg * 0.5)
-        # In marker_frame, assume x-forward, y-left (once you're in base_link)
-        x_len = self.fov_range * math.cos(half_angle_rad)
-        y_off = self.fov_range * math.sin(half_angle_rad)
+
+        # Unit vectors in the marker_frame plane
+        # Standard REP-103 base_link axes:
+        #   x forward, y left, z up
+        forward = np.array([1.0, 0.0], dtype=float)   # forward
+        leftvec = np.array([0.0, 1.0], dtype=float)   # left
+
+
+        # Normalize in case
+        f_norm = forward / (np.linalg.norm(forward) + 1e-9)
+        l_norm = leftvec / (np.linalg.norm(leftvec) + 1e-9)
+
+        # Directions of left/right rays: rotate 'forward' by ±half_angle about +z
+        #   dir_left  = cos(a)*f + sin(a)*l
+        #   dir_right = cos(a)*f - sin(a)*l
+        ca = math.cos(half_angle_rad)
+        sa = math.sin(half_angle_rad)
+
+        dir_left  = ca * f_norm + sa * l_norm
+        dir_right = ca * f_norm - sa * l_norm
 
         origin = geometry_msgs.msg.Point()
         origin.x = 0.0
         origin.y = 0.0
         origin.z = 0.0
 
-        left = geometry_msgs.msg.Point()
-        left.x = x_len
-        left.y = y_off
-        left.z = 0.0
+        left_pt = geometry_msgs.msg.Point()
+        left_pt.x = float(dir_left[0] * self.fov_range)
+        left_pt.y = float(dir_left[1] * self.fov_range)
+        left_pt.z = 0.0
 
-        right = geometry_msgs.msg.Point()
-        right.x = x_len
-        right.y = -y_off
-        right.z = 0.0
+        right_pt = geometry_msgs.msg.Point()
+        right_pt.x = float(dir_right[0] * self.fov_range)
+        right_pt.y = float(dir_right[1] * self.fov_range)
+        right_pt.z = 0.0
 
         # Two segments: origin->left, origin->right
         fov.points.append(origin)
-        fov.points.append(left)
+        fov.points.append(left_pt)
         fov.points.append(origin)
-        fov.points.append(right)
+        fov.points.append(right_pt)
 
         fov.scale.x = 0.03  # line width
 
@@ -573,7 +594,7 @@ class YoloPeopleProximityNode:
         fov.color.b = 0.2
         fov.color.a = 0.9
 
-        fov.lifetime = rospy.Duration(0.5)
+        fov.lifetime = rospy.Duration(0.0) # persistent
         marray.markers.append(fov)
 
         # ──────────────────────────────
@@ -591,7 +612,7 @@ class YoloPeopleProximityNode:
         """
         pt_cam = PointStamped()
         pt_cam.header.stamp = stamp
-        pt_cam.header.frame_id = self.camera_frame
+        pt_cam.header.frame_id = self.camera_frame # <- now the optical frame
         pt_cam.point.x = X_cam
         pt_cam.point.y = Y_cam
         pt_cam.point.z = Z_cam
@@ -602,8 +623,8 @@ class YoloPeopleProximityNode:
             rospy.logwarn_throttle(1.0, "TF transform %s -> %s failed: %s",
                                    self.camera_frame, self.base_frame, str(e))
             return 0.0, 0.0
-
-        # In base_link, we expect x=forward, y=left
+        # In base_link, we now expect:
+        #   x ≈ forward, y ≈ left, z ≈ up
         return float(pt_base.point.x), float(pt_base.point.y)
 
 
@@ -880,6 +901,10 @@ class YoloPeopleProximityNode:
         depth_cv = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding="32FC1")
         return vis, depth_cv
 
+    def _make_safe_alert(self) -> AlertInfo:
+        # No offender, margin = +inf, active = False
+        return AlertInfo(active=False, margin=float('inf'), offender=None)
+
     def _handle_no_people(self, vis, dynamic_threshold: float, rgb_msg):
         """
         Called when YOLO finds no valid person detections.
@@ -923,6 +948,16 @@ class YoloPeopleProximityNode:
             dbg.header.stamp = rgb_msg.header.stamp
             dbg.header.frame_id = rgb_msg.header.frame_id or "camera"
             self.debug_img_pub.publish(dbg)
+
+        # --- NEW: publish FOV (and any remaining tracks) even with no people ---
+        if self.marker_pub is not None:
+            per_person_thresholds = {}  # nothing special per track
+            alert_info = self._make_safe_alert()
+            self._publish_track_markers(
+                per_person_thresholds,
+                alert_info,
+                rgb_msg.header.stamp
+            )
 
     def _update_tracks_from_people(self, people: List[PersonDet], tstamp: float):
         """Build metric dets from PersonDet list and run association in base_link frame."""
@@ -1147,6 +1182,24 @@ class YoloPeopleProximityNode:
         ids, dists, speeds = [], [], []
         closest_dist = None
         best_approach = 0.0
+
+
+        # QUICK DEBUG
+        
+        for tid, tr in self.tracks.items():
+            if tr.xy is not None:
+                # You also have full pt_base.z somewhere if you want; for now assume ~0 if you're using ground projection
+                x = tr.xy[0]
+                y = tr.xy[1]
+                # if you have z_base, use it; otherwise treat z=0 for a horizontal check
+                z = 0.0
+
+                r_xy = math.hypot(x, y)
+                rospy.loginfo_throttle(
+                    0.5,
+                    "Track %d: x=%.2f, y=%.2f, r_xy=%.2f, depth=%.2f",
+                    tid, x, y, r_xy, tr.dist
+                )
 
         for tid, tr in self.tracks.items():
             ids.append(tid)
