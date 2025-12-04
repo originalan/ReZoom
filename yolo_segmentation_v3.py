@@ -4,11 +4,15 @@
 #   ~person_distance_threshold
 #   ~speed_gain
 #   ~person_speed_gain
-#   ~perp_gain
+#   ~perp_gain — how much extra buffer to add per m/s of lateral relative speed.
 #   ~max_dist_jump — meters allowed between frames for same person; tighten if IDs switch when people cross.
 #   ~max_misses — how many frames a person can disappear (occlusion) before we drop the track.
 #   ~filter_alpha — higher = more responsive, lower = smoother speeds. 
 #   ~ttc_horizon, ~dca_limit — crossing risk parameters. Nudge ttc_horizon up (e.g. 2.0 → 3.0 s) and/or dca_limit up (0.8 → 1.0 m) to catch more crossers.
+#   ~assoc_xy_gate — max lateral distance (m) for associating detections to tracks. Lower to reduce ID switches when people cross.
+#   ~min_alert_age — min frames before a track can raise an alert. Increase to reduce false alarms on spurious tracks.
+#   ~min_vel_age — min frames before a track shows velocity arrows. Increase to avoid showing arrows for shaky tracks.
+#   ~min_cross_speed — min lateral speed (m/s) to consider for crossing risk. lower = more sensitive to slow walkers
 
 #improvements: right now everything is relative to the escooter, not to the world. also, perpendicular detection works on the basis that the scooter is always moving exactly forward, which isn't always the case. 
 """
@@ -75,7 +79,7 @@ from sensor_msgs.msg import CameraInfo
 
 from ultralytics import YOLO  # YOLOv8
 
-DETECTION_DISTANCE = 0.9  # m
+DETECTION_DISTANCE = 0.7  # m
 VEHICLE_SPEED_GAIN = 0.5   # m per m/s
 PERSON_SPEED_GAIN  = 0.5   # m per m/s of person radial speed
 FRAME_SKIP = 2             # process every (N+1)th frame
@@ -132,7 +136,7 @@ class AlertInfo:
 # ---------------- Small per-person track ----------------
 class Track:
     __slots__ = ("id","cx","cy","dist","filt_dist","prev_time","prev_for_speed",
-                 "radial","misses","xy","prev_xy","vxy")
+                 "radial","misses","xy","prev_xy","vxy","age")
 
     def __init__(self, tid:int, cx:int, cy:int, dist:float, tstamp:float, xy:Tuple[float,float]):
         self.id = tid
@@ -146,6 +150,7 @@ class Track:
         self.xy = xy
         self.prev_xy = None
         self.vxy = np.array([0.0, 0.0], dtype=float)
+        self.age = 1  # frames this track has been matched
 
     def update(self, cx:int, cy:int, dist:float, tstamp:float, alpha:float,
                xy:Tuple[float,float], dt_lo:float=0.02, dt_hi:float=0.5):
@@ -166,6 +171,7 @@ class Track:
         self.prev_xy = self.xy
         self.xy = xy
         self.misses = 0
+        self.age += 1  # one more successful association
 
 # ---------------- Main Node ----------------
 class YoloPeopleProximityNode:
@@ -202,16 +208,24 @@ class YoloPeopleProximityNode:
         cam_info_topic = rospy.get_param("~camera_info_topic", "/zed_node/left/camera_info")
         self.caminfo_sub = rospy.Subscriber(cam_info_topic, CameraInfo, self._caminfo_cb, queue_size=1)
 
+        # association & maturity
+        self.assoc_xy_gate = rospy.get_param("~assoc_xy_gate", 1.4)  # meters
+        self.min_alert_age = rospy.get_param("~min_alert_age", 2)    # frames
+        self.min_vel_age   = rospy.get_param("~min_vel_age", 2)      # frames
+
         # horizon / gains for “crossing” risk
         self.ttc_horizon = float(rospy.get_param("~ttc_horizon", 2.5))   # seconds
-        self.dca_limit   = float(rospy.get_param("~dca_limit",   0.8))   # m, distance at closest approach
-        self.perp_gain   = float(rospy.get_param("~perp_gain",   0.6))   # m of extra buffer per m/s of perpendicular rel speed
+        self.dca_limit   = float(rospy.get_param("~dca_limit",   2.7))   # m, distance at closest approach
+        self.perp_gain   = float(rospy.get_param("~perp_gain",   0.4))   # m of extra buffer per m/s of perpendicular rel speed
 
         # gates / smoothing
         self.max_dist_jump  = rospy.get_param("~max_dist_jump", MAX_DISTANCE_JUMP)  # m (for both single & multi)
         self.max_misses     = rospy.get_param("~max_misses", 5)                    # drop track after N misses
         self.filter_alpha   = rospy.get_param("~filter_alpha", 0.3)                # EMA for distances
         self.max_threshold  = rospy.get_param("~max_threshold", MAX_POSSIBLE_THRESHOLD_DISTANCE)
+
+        self.min_cross_speed = rospy.get_param("~min_cross_speed", 0.15)  # m/s
+
 
         # vehicle speed
         self.current_speed  = 0.0
@@ -407,6 +421,12 @@ class YoloPeopleProximityNode:
             if not (np.isfinite(tr.xy[0]) and np.isfinite(tr.xy[1])):
                 continue
 
+            # Only draw arrows for reasonably mature tracks
+            if tr.age < self.min_vel_age:
+                continue
+            if tr.misses > 0:
+                continue
+
             vx, vy = float(tr.vxy[0]), float(tr.vxy[1])
             speed_norm = math.hypot(vx, vy)
             if speed_norm < 1e-3:
@@ -589,9 +609,10 @@ class YoloPeopleProximityNode:
 
         fov.scale.x = 0.03  # line width
 
-        fov.color.r = 0.8
-        fov.color.g = 0.8
-        fov.color.b = 0.2
+        if alert_info.active:
+            fov.color.r, fov.color.g, fov.color.b = 1.0, 0.0, 0.0
+        else:
+            fov.color.r, fov.color.g, fov.color.b = 0.8, 0.8, 0.2
         fov.color.a = 0.9
 
         fov.lifetime = rospy.Duration(0.0) # persistent
@@ -795,12 +816,15 @@ class YoloPeopleProximityNode:
                 tr = self.tracks[tid]
                 for j in list(unmatched_dets):
                     cx, cy, d, X, Y = dets[j]
-                    # gates
-                    if math.hypot(tr.xy[0] - X, tr.xy[1] - Y) > 1.4:  # meters; tune
+                    # gates in metric space
+                    dXY = math.hypot(tr.xy[0] - X, tr.xy[1] - Y)
+                    if dXY > self.assoc_xy_gate:
                         continue
-                    if abs(tr.dist - d) > self.max_dist_jump:
+                    dd = abs(tr.dist - d)
+                    if dd > self.max_dist_jump:
                         continue
                     c = cost(tr, dets[j])
+
                     if (best is None) or (c < best):
                         best = c; best_pair = (tid, j)
             if best_pair is None: break
@@ -984,41 +1008,69 @@ class YoloPeopleProximityNode:
         """
         Compute per-track thresholds, inflating base dynamic threshold by:
           - approaching radial speed
-          - crossing risk in camera XY plane within TTC horizon and DCA limit.
+          - crossing risk in base_link XY plane within TTC horizon and DCA limit.
         """
         per_person_thresholds: Dict[int, float] = {}
+
         for tid, tr in self.tracks.items():
             thr = dynamic_threshold
 
-            # original approach inflation
-            if tr.radial is not None and tr.radial > 0.0:
+            # 1) Approach inflation (radial toward the scooter)
+            if tr.radial is not None and np.isfinite(tr.radial) and tr.radial > 0.0:
                 thr = min(thr + self.person_speed_gain * tr.radial, self.max_threshold)
 
-            # crossing risk in camera XY
-            r = np.array(tr.xy, dtype=float) if tr.xy is not None else np.zeros(2, dtype=float)
+            # 2) Crossing risk using full XY velocity (perpendicular-ish motion)
+            r = np.array(tr.xy, dtype=float) if tr.xy is not None else None
             v = tr.vxy
-            t_star, d_star = self._closest_approach(r, v)
 
-            crossing = (
-                (t_star >= 0.0) and (t_star <= self.ttc_horizon) and
-                (d_star < self.dca_limit) and
-                (tr.radial is not None and tr.radial > 0.0)
-            )
-            if crossing:
-                thr = min(thr + self.perp_gain * float(np.linalg.norm(v)), self.max_threshold)
+            if r is not None and v is not None:
+                if np.isfinite(r).all() and np.isfinite(v).all():
+                    speed_norm = float(np.linalg.norm(v))
+
+                    # Ignore essentially static people
+                    if speed_norm >= self.min_cross_speed:
+                        t_star, d_star = self._closest_approach(r, v)
+
+                        # Are they going to get significantly closer than they are now?
+                        current_dist = float(tr.filt_dist)
+
+                        crossing = (
+                            (t_star >= 0.0) and
+                            (t_star <= self.ttc_horizon) and
+                            (d_star <= self.dca_limit)
+                        )
+
+                        rospy.loginfo_throttle(
+                            0.5,
+                            "[cross] ID %d: dist=%.2f thr=%.2f |v|=%.2f "
+                            "t*=%.2f d*=%.2f crossing=%s",
+                            tid,
+                            current_dist,
+                            thr,
+                            speed_norm,
+                            t_star,
+                            d_star,
+                            str(crossing),
+                        )
+
+                        if crossing:
+                            thr = min(thr + self.perp_gain * speed_norm, self.max_threshold)
 
             per_person_thresholds[tid] = thr
 
         return per_person_thresholds
 
-    def _log_tracks(self):
-        """Throttled per-track logging of distance/radial/misses."""
+    
+    def _log_tracks(self, per_person_thresholds):
+        """Throttled per-track logging of distance, threshold, radial, misses."""
         for tid, tr in sorted(self.tracks.items()):
             rs = "NA" if tr.radial is None or not np.isfinite(tr.radial) else f"{tr.radial:.2f}"
+            thr = per_person_thresholds.get(tid, self.base_threshold)
+
             rospy.loginfo_throttle(
                 0.5,
-                "[ID %d] dist=%.2f m  radial=%s m/s  misses=%d",
-                tid, tr.filt_dist, rs, tr.misses
+                "[ID %d] dist=%.2f m  thr=%.2f m  radial=%s m/s  misses=%d",
+                tid, tr.filt_dist, thr, rs, tr.misses
             )
 
     def _publish_debug_image(self, vis, rgb_msg, dynamic_threshold: float,
@@ -1087,7 +1139,11 @@ class YoloPeopleProximityNode:
             dist_ok = (tr.filt_dist is not None) and np.isfinite(tr.filt_dist)
             if not dist_ok:
                 continue
-
+            # Require a minimum age and no recent misses to avoid using shaky tracks
+            if tr.age < self.min_alert_age:
+                continue
+            if tr.misses > 0:
+                continue
             # relative position/velocity in camera XY
             r = tr.xy if tr.xy is not None else np.zeros(2, dtype=float)
             v = tr.vxy
@@ -1183,23 +1239,21 @@ class YoloPeopleProximityNode:
         closest_dist = None
         best_approach = 0.0
 
-
         # QUICK DEBUG
-        
-        for tid, tr in self.tracks.items():
-            if tr.xy is not None:
-                # You also have full pt_base.z somewhere if you want; for now assume ~0 if you're using ground projection
-                x = tr.xy[0]
-                y = tr.xy[1]
-                # if you have z_base, use it; otherwise treat z=0 for a horizontal check
-                z = 0.0
+        # for tid, tr in self.tracks.items():
+        #     if tr.xy is not None:
+        #         # You also have full pt_base.z somewhere if you want; for now assume ~0 if you're using ground projection
+        #         x = tr.xy[0]
+        #         y = tr.xy[1]
+        #         # if you have z_base, use it; otherwise treat z=0 for a horizontal check
+        #         z = 0.0
 
-                r_xy = math.hypot(x, y)
-                rospy.loginfo_throttle(
-                    0.5,
-                    "Track %d: x=%.2f, y=%.2f, r_xy=%.2f, depth=%.2f",
-                    tid, x, y, r_xy, tr.dist
-                )
+        #         r_xy = math.hypot(x, y)
+        #         rospy.loginfo_throttle(
+        #             0.5,
+        #             "Track %d: x=%.2f, y=%.2f, r_xy=%.2f, depth=%.2f",
+        #             tid, x, y, r_xy, tr.dist
+        #         )
 
         for tid, tr in self.tracks.items():
             ids.append(tid)
@@ -1245,8 +1299,8 @@ class YoloPeopleProximityNode:
         # 10) Per-person thresholds (vehicle + radial + crossing risk)
         per_person_thresholds = self._compute_per_person_thresholds(dynamic_threshold)
 
-        # 11) Per-track logging
-        self._log_tracks()
+        # 11) Per-track logging (log each person's threshold too)
+        self._log_tracks(per_person_thresholds)
 
         # 12) Debug overlay (masks tinted by threshold crossing)
         self._publish_debug_image(vis, rgb_msg, dynamic_threshold,
