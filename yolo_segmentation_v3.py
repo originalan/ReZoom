@@ -15,44 +15,17 @@
 #   ~min_cross_speed — min lateral speed (m/s) to consider for crossing risk. lower = more sensitive to slow walkers
 
 #improvements: right now everything is relative to the escooter, not to the world. also, perpendicular detection works on the basis that the scooter is always moving exactly forward, which isn't always the case. 
-"""
-3.1 World-frame / base_link-frame tracking [DONE]
-Right now:
-tr.vxy comes from finite difference on tr.xy across frames.
-Now that tr.xy is in base_link, vxy is “person velocity in base_link frame” relative to the robot pose (but not yet subtracting robot’s own motion).
 
-3.2 True relative velocity (person vs scooter), not just mask motion
-Right now tr.vxy is based on person motion in camera XY only. But the scooter is also moving, and potentially turning.
-True relative velocity in base_link:
-v_rel = v_person_world - v_scooter_world
-Simple future pipeline:
-Approximate person world pose over time by:
-At each frame: get person XY in base_link as above.
-Transform base_link → world (odom/map) and store person’s world XY.
-Scooter world velocity: you already have Odometry – you can use its twist in odom frame.
-Compute v_person_world as finite difference of world XY positions.
-Compute v_rel = v_person_world - v_scooter_world.
-Then:
-Use r_rel and v_rel in _closest_approach.
-Use longitudinal component along vehicle heading to determine “approach” vs “moving away”.
-Use lateral component for crossing risk.
-This would remove your current assumption:
-perpendicular detection works on the basis that the scooter is always moving exactly forward
-Instead, it would be aligned with the actual velocity vector/orientation from odom.
-This is a bigger refactor, but your current structure (Track, PersonDet, AlertInfo) is already in a good shape to support it.
+# simulating scooter velocity:
 
-3.3 Dynamic model-based TTC (vs just distance threshold)
-Right now you do:
-Distance < threshold → alert.
-Future variant:
-Use a “braking model” TTC:
-t_brake = v / a_max  (assuming constant decel)
-d_brake = v * t_brake - 0.5 * a_max * t_brake^2
-Or more simply: d_safe = v * t_reaction + (v^2)/(2 a_max).
-You can then say:
-If predicted closest distance d_star < d_safe, raise an alert, even if current distance is still large.
-This makes behaviour more interpretable in terms of “can I stop in time” rather than “is person within X meters”.
-"""
+# rostopic pub /odom nav_msgs/Odometry "
+# twist:
+#   twist:
+#     linear:
+#       x: 1.0
+#       y: 1.0
+#       z: 0.0
+# "
 
 import cv2
 
@@ -60,6 +33,7 @@ import tf2_ros
 import tf2_geometry_msgs
 import geometry_msgs.msg
 from geometry_msgs.msg import PointStamped
+from std_msgs.msg import UInt8  
 
 from visualization_msgs.msg import Marker, MarkerArray
 
@@ -79,12 +53,15 @@ from sensor_msgs.msg import CameraInfo
 
 from ultralytics import YOLO  # YOLOv8
 
-DETECTION_DISTANCE = 0.7  # m
+DETECTION_DISTANCE = 0.8  # m
 VEHICLE_SPEED_GAIN = 0.5   # m per m/s
 PERSON_SPEED_GAIN  = 0.5   # m per m/s of person radial speed
 FRAME_SKIP = 2             # process every (N+1)th frame
 MAX_DISTANCE_JUMP = 1.75   # m (inter-frame distance gate)
 MAX_POSSIBLE_THRESHOLD_DISTANCE = 5.0  # m
+
+# Hazard levels (match supervisor)
+CLEAR, WARN, SLOW, STOP = 0, 1, 2, 3
 
 # ---------------- Single-person detection structure ----------------
 @dataclass
@@ -199,7 +176,7 @@ class YoloPeopleProximityNode:
         self.marker_pub = rospy.Publisher("~people_markers", MarkerArray, queue_size=1)
 
         # FOV visualization (for RViz only)
-        self.fov_angle_deg = rospy.get_param("~fov_angle_deg", 85.0)  # total horizontal FOV
+        self.fov_angle_deg = rospy.get_param("~fov_angle_deg", 93.0)  # total horizontal FOV
         self.fov_range     = rospy.get_param("~fov_range", 5.0)       # how far to draw the FOV rays (m)
 
         # --- camera intrinsics (px) ---
@@ -226,6 +203,7 @@ class YoloPeopleProximityNode:
 
         self.min_cross_speed = rospy.get_param("~min_cross_speed", 0.15)  # m/s
 
+        self._published_marker_ids = set()
 
         # vehicle speed
         self.current_speed  = 0.0
@@ -251,13 +229,19 @@ class YoloPeopleProximityNode:
         # ---------------- Publishers ----------------
         self.alert_pub = rospy.Publisher("~people_proximity_alert", Bool, queue_size=1)
         self.closest_dist_pub = rospy.Publisher("~closest_person_distance", Float32, queue_size=1)
+        self.threshold_pub = rospy.Publisher("~dynamic_threshold", Float32, queue_size=1)
 
         self.publish_debug = rospy.get_param("~publish_debug", True)
         self.debug_img_pub = rospy.Publisher("~debug_image", Image, queue_size=1)
 
         self.require_masks = rospy.get_param("~require_masks", True)
+        
+        self.hazard_level_pub  = rospy.Publisher("~hazard_level", UInt8, queue_size=1)
+        self.hazard_margin_pub = rospy.Publisher("~hazard_margin", Float32, queue_size=1)
+        self.hazard_ttc_pub    = rospy.Publisher("~hazard_ttc", Float32, queue_size=1)
+        self.hazard_dca_pub    = rospy.Publisher("~hazard_dca", Float32, queue_size=1)
 
-        # NEW: multi-person outputs
+        # multi-person outputs
         self.ids_pub   = rospy.Publisher("~people_ids", Int32MultiArray, queue_size=1)
         self.dists_pub = rospy.Publisher("~people_distances", Float32MultiArray, queue_size=1)
         self.speeds_pub= rospy.Publisher("~people_radial_speeds", Float32MultiArray, queue_size=1)
@@ -269,7 +253,7 @@ class YoloPeopleProximityNode:
         self.ts = message_filters.ApproximateTimeSynchronizer([rgb_sub, depth_sub], queue_size=5, slop=0.05)
         self.ts.registerCallback(self.synced_callback)
 
-        # NEW: tracking state
+        # tracking state
         self.tracks: Dict[int, Track] = {}
         self.next_tid = 1
 
@@ -335,6 +319,7 @@ class YoloPeopleProximityNode:
         per_person_thresholds: Dict[int, float],
         alert_info: AlertInfo,
         stamp: rospy.Time,
+        dynamic_threshold: float,
     ):
         """
         Publish RViz markers for each tracked person.
@@ -546,6 +531,49 @@ class YoloPeopleProximityNode:
 
             marray.markers.append(line)
 
+            # THRESHOLD CIRCLES AROUND EACH PERSON
+            # ──────────────────────────────
+            # Per person threshold ring around each person
+            # ──────────────────────────────
+            thr = float(per_person_thresholds.get(tid, self.base_threshold))
+            thr_scaled = thr * 1.5;  # scale up for better visibility; the actual threshold violation is still based on the original thr
+
+            ring = Marker()
+            ring.header.stamp = stamp
+            ring.header.frame_id = self.marker_frame
+            ring.ns = "people_threshold_rings"
+            ring.id = tid
+            ring.type = Marker.LINE_STRIP
+            ring.action = Marker.ADD
+
+            ring.pose.orientation.w = 1.0
+            ring.scale.x = 0.03  # line width
+
+            # Color: red if inside thr, green otherwise (same logic as sphere)
+            dist = tr.filt_dist if tr.filt_dist is not None else tr.dist
+            inside = (dist is not None) and np.isfinite(dist) and (dist < thr)
+            if inside:
+                ring.color.r, ring.color.g, ring.color.b = 1.0, 0.0, 0.0
+            else:
+                ring.color.r, ring.color.g, ring.color.b = 0.0, 1.0, 0.0
+            ring.color.a = 0.8
+
+            # Build a circle in the XY plane centered at the person's position
+            ring.points = []
+            cx = float(tr.xy[0])
+            cy = float(tr.xy[1])
+            N = 40
+            for k in range(N + 1):
+                ang = 2.0 * math.pi * k / N
+                p = geometry_msgs.msg.Point()
+                p.x = cx + thr_scaled * math.cos(ang)
+                p.y = cy + thr_scaled * math.sin(ang)
+                p.z = 0.02
+                ring.points.append(p)
+
+            ring.lifetime = rospy.Duration(0.5)
+            marray.markers.append(ring)
+
         # ──────────────────────────────
         # 4) FOV wedge (simple two rays)
         # ──────────────────────────────
@@ -618,10 +646,102 @@ class YoloPeopleProximityNode:
         fov.lifetime = rospy.Duration(0.0) # persistent
         marray.markers.append(fov)
 
+        current_ids = set(self.tracks.keys())
+
+        # ──────────────────────────────
+        # DRAW THRESHOLD CIRCLE based on vehicle speed
+        # ──────────────────────────────
+        circle = Marker()
+        circle.header.stamp = stamp
+        circle.header.frame_id = self.marker_frame
+        circle.ns = "threshold"
+        circle.id = 999
+        circle.type = Marker.CYLINDER
+        circle.action = Marker.ADD
+
+        circle.pose.position.x = 0.0
+        circle.pose.position.y = 0.0
+        circle.pose.position.z = 0.0
+        circle.pose.orientation.w = 1.0
+
+        circle.scale.x = 3.0 * dynamic_threshold
+        circle.scale.y = 3.0 * dynamic_threshold
+        circle.scale.z = 0.01
+
+        circle.color.r = 1.0
+        circle.color.g = 1.0
+        circle.color.b = 0.0
+        circle.color.a = 0.2
+
+        circle.lifetime = rospy.Duration(0.2)
+
+        marray.markers.append(circle)
+
+
+        # Delete markers for tracks that no longer exist
+        stale_ids = self._published_marker_ids - current_ids
+        for tid in stale_ids:
+            for ns in ["people_tracks", "people_vel", "people_ttc", "people_threshold_rings", "people_ttc_ray"]:
+                m = Marker()
+                m.header.stamp = stamp
+                m.header.frame_id = self.marker_frame
+                m.ns = ns
+                m.id = tid
+                m.action = Marker.DELETE
+                marray.markers.append(m)
+
+        self._published_marker_ids = current_ids
+
         # ──────────────────────────────
         # Publish all markers
         # ──────────────────────────────
         self.marker_pub.publish(marray)
+
+    def _hazard_level_from_alert(self, alert_info: AlertInfo) -> int:
+        """
+        Map AlertInfo -> hazard level.
+        0 CLEAR, 1 WARN, 2 SLOW, 3 STOP
+        """
+        # Tunable params
+        warn_margin = float(rospy.get_param("~haz_warn_margin", 0.5))   # m
+        slow_margin = float(rospy.get_param("~haz_slow_margin", 0.2))  # m
+        stop_margin = float(rospy.get_param("~haz_stop_margin", -0.1))  # m
+
+        stop_ttc = float(rospy.get_param("~haz_stop_ttc", 1.0))          # s
+        stop_dca = float(rospy.get_param("~haz_stop_dca", 0.8))          # m
+
+        # If no valid tracks/offender
+        if alert_info is None:
+            return CLEAR
+
+        margin = float(alert_info.margin)
+
+        # If nothing valid, treat as CLEAR (supervisor will still fail-safe on stale)
+        if not np.isfinite(margin):
+            return CLEAR
+
+        offender = alert_info.offender
+
+        # STOP if deeply inside threshold OR imminent closest approach
+        if margin <= stop_margin:
+            return STOP
+
+        if offender is not None:
+            t_star = float(offender.t_star)
+            d_star = float(offender.d_star)
+            if np.isfinite(t_star) and np.isfinite(d_star):
+                if (0.0 <= t_star <= stop_ttc) and (d_star <= stop_dca):
+                    return STOP
+
+        # SLOW if inside threshold
+        if margin <= slow_margin or (alert_info.active is True):
+            return SLOW
+
+        # WARN if close to threshold
+        if margin <= warn_margin:
+            return WARN
+
+        return CLEAR
 
     def _camera_to_base_xy(self, X_cam: float, Y_cam: float, Z_cam: float,
                            stamp: rospy.Time) -> Tuple[float, float]:
@@ -944,6 +1064,17 @@ class YoloPeopleProximityNode:
         self.alert_active = False
         self.alert_pub.publish(False)
 
+        # Publish a finite, positive margin instead of inf
+        safe_margin = float(dynamic_threshold)
+        self.hazard_margin_pub.publish(Float32(data=safe_margin))
+
+        # No offender → publish NaNs for TTC/DCA
+        self.hazard_ttc_pub.publish(Float32(data=float("nan")))
+        self.hazard_dca_pub.publish(Float32(data=float("nan")))
+
+        # Explicitly publish CLEAR
+        self.hazard_level_pub.publish(UInt8(data=0))  # CLEAR
+
         # Age out existing tracks
         for tid in list(self.tracks.keys()):
             tr = self.tracks[tid]
@@ -973,14 +1104,15 @@ class YoloPeopleProximityNode:
             dbg.header.frame_id = rgb_msg.header.frame_id or "camera"
             self.debug_img_pub.publish(dbg)
 
-        # --- NEW: publish FOV (and any remaining tracks) even with no people ---
+        # --- Publish FOV (and any remaining tracks) even with no people ---
         if self.marker_pub is not None:
             per_person_thresholds = {}  # nothing special per track
             alert_info = self._make_safe_alert()
             self._publish_track_markers(
                 per_person_thresholds,
                 alert_info,
-                rgb_msg.header.stamp
+                rgb_msg.header.stamp,
+                dynamic_threshold
             )
 
     def _update_tracks_from_people(self, people: List[PersonDet], tstamp: float):
@@ -1124,75 +1256,76 @@ class YoloPeopleProximityNode:
         """
         Decide global alert from per-person thresholds and log the result.
 
-        Returns:
-            AlertInfo with:
-              - active: whether any person is inside its threshold
-              - margin: min(dist - thr) across all tracks (neg = violation)
-              - offender: details of the worst offender, if any
+        margin is now:  min(dist - thr) across all *eligible* tracks
+        - negative => someone is inside threshold (violation)
+        - positive => closest person is still outside threshold (how much buffer remains)
+        - +inf     => no eligible tracks this frame
         """
-        active = False
         best_margin = float('inf')
         best_offender: Optional[OffenderInfo] = None
 
         for tid, tr in self.tracks.items():
             thr = per_person_thresholds.get(tid, dynamic_threshold)
-            dist_ok = (tr.filt_dist is not None) and np.isfinite(tr.filt_dist)
-            if not dist_ok:
+
+            # Basic validity
+            if tr.filt_dist is None or not np.isfinite(tr.filt_dist):
                 continue
-            # Require a minimum age and no recent misses to avoid using shaky tracks
+
+            # Maturity / stability filters (keep your intent)
             if tr.age < self.min_alert_age:
                 continue
             if tr.misses > 0:
                 continue
-            # relative position/velocity in camera XY
-            r = tr.xy if tr.xy is not None else np.zeros(2, dtype=float)
-            v = tr.vxy
+
+            # margin is defined for ALL tracks now
+            margin = float(tr.filt_dist - thr)
+
+            # compute closest-approach metrics for the offender record
+            r = np.array(tr.xy, dtype=float) if tr.xy is not None else np.zeros(2, dtype=float)
+            v = tr.vxy if tr.vxy is not None else np.zeros(2, dtype=float)
             t_star, d_star = self._closest_approach(r, v)
-            vnorm = float(np.linalg.norm(v))
+            vnorm = float(np.linalg.norm(v)) if v is not None else 0.0
 
-            if tr.filt_dist < thr:
-                active = True
-                margin = tr.filt_dist - thr  # negative = violation
-                if margin < best_margin:
-                    best_margin = margin
-                    best_offender = OffenderInfo(
-                        tid=tid,
-                        dist=float(tr.filt_dist),
-                        threshold=float(thr),
-                        vrad=(None if tr.radial is None else float(tr.radial)),
-                        t_star=float(t_star),
-                        d_star=float(d_star),
-                        vnorm=vnorm,
-                    )
+            if margin < best_margin:
+                best_margin = margin
+                best_offender = OffenderInfo(
+                    tid=tid,
+                    dist=float(tr.filt_dist),
+                    threshold=float(thr),
+                    vrad=(None if tr.radial is None else float(tr.radial)),
+                    t_star=float(t_star),
+                    d_star=float(d_star),
+                    vnorm=vnorm,
+                )
 
-        # publish alert state
+        # active if best_margin is a real number and negative
+        active = (best_offender is not None) and np.isfinite(best_margin) and (best_margin < 0.0)
+
+        # publish alert state (backwards compatible)
         self.alert_active = active
         self.alert_pub.publish(self.alert_active)
 
-        if self.alert_active and best_offender is not None:
+        if best_offender is not None and np.isfinite(best_margin):
             o = best_offender
-            rospy.logwarn(
-                "ALERT: TID=%d dist=%.2f m < thr=%.2f m | veh=%.2f m/s | v_r=%.2f m/s "
-                "| crossing: t*=%+.2f s d*==%.2f m | |v_xy|=%.2f m/s",
-                o.tid,
-                o.dist,
-                o.threshold,
-                self.current_speed,
-                (float('nan') if o.vrad is None else o.vrad),
-                o.t_star,
-                o.d_star,
-                o.vnorm,
-            )
+            if active:
+                rospy.logwarn(
+                    "ALERT: TID=%d dist=%.2f thr=%.2f margin=%.2f | veh=%.2f m/s | "
+                    "v_r=%s | t*=%+.2f d*=%.2f | |v_xy|=%.2f",
+                    o.tid, o.dist, o.threshold, best_margin, self.current_speed,
+                    ("NA" if o.vrad is None or not np.isfinite(o.vrad) else f"{o.vrad:.2f}"),
+                    o.t_star, o.d_star, o.vnorm
+                )
+            else:
+                rospy.loginfo_throttle(
+                    1.0,
+                    "SAFE: closest margin=%.2f m (TID=%d dist=%.2f thr=%.2f) veh=%.2f m/s",
+                    best_margin, o.tid, o.dist, o.threshold, self.current_speed
+                )
         else:
-            # SAFE or no valid offender; best_margin is +inf if no valid tracks
-            rospy.loginfo_throttle(
-                1.0,
-                "SAFE: veh=%.2f m/s | min(dist - thr)=%.2f m",
-                self.current_speed,
-                best_margin,
-            )
+            rospy.loginfo_throttle(1.0, "SAFE: no eligible tracks (margin=inf) veh=%.2f m/s", self.current_speed)
 
         return AlertInfo(active=active, margin=best_margin, offender=best_offender)
+
 
     # ---------------- Main callback ----------------
     def synced_callback(self, rgb_msg, depth_msg):
@@ -1206,6 +1339,7 @@ class YoloPeopleProximityNode:
 
         # 2) Dynamic threshold from vehicle speed
         dynamic_threshold = self._compute_dynamic_threshold()
+        self.threshold_pub.publish(Float32(data=float(dynamic_threshold)))
 
         # 3) Prepare images (BGR8 + depth)
         vis, depth_cv = self._prepare_images(rgb_msg, depth_msg)
@@ -1238,22 +1372,6 @@ class YoloPeopleProximityNode:
         ids, dists, speeds = [], [], []
         closest_dist = None
         best_approach = 0.0
-
-        # QUICK DEBUG
-        # for tid, tr in self.tracks.items():
-        #     if tr.xy is not None:
-        #         # You also have full pt_base.z somewhere if you want; for now assume ~0 if you're using ground projection
-        #         x = tr.xy[0]
-        #         y = tr.xy[1]
-        #         # if you have z_base, use it; otherwise treat z=0 for a horizontal check
-        #         z = 0.0
-
-        #         r_xy = math.hypot(x, y)
-        #         rospy.loginfo_throttle(
-        #             0.5,
-        #             "Track %d: x=%.2f, y=%.2f, r_xy=%.2f, depth=%.2f",
-        #             tid, x, y, r_xy, tr.dist
-        #         )
 
         for tid, tr in self.tracks.items():
             ids.append(tid)
@@ -1310,8 +1428,27 @@ class YoloPeopleProximityNode:
         alert_info = self._compute_alert_and_log(dynamic_threshold, per_person_thresholds)
         # alert_info.active, alert_info.margin, alert_info.offender are now available
 
+        # ---- Publish hazard outputs for supervisor node ----
+        level = self._hazard_level_from_alert(alert_info)
+
+        self.hazard_level_pub.publish(UInt8(data=int(level)))
+        margin = alert_info.margin
+        if not np.isfinite(margin):
+            # Tracks exist but none eligible → treat as safely outside threshold
+            margin = float(dynamic_threshold)
+
+        self.hazard_margin_pub.publish(Float32(data=margin))
+
+        if alert_info.offender is not None:
+            self.hazard_ttc_pub.publish(Float32(data=float(alert_info.offender.t_star)))
+            self.hazard_dca_pub.publish(Float32(data=float(alert_info.offender.d_star)))
+        else:
+            # publish NaNs or big defaults; NaN is fine for Float32
+            self.hazard_ttc_pub.publish(Float32(data=float("nan")))
+            self.hazard_dca_pub.publish(Float32(data=float("nan")))
+
         # 14) RViz markers for tracks in marker_frame
-        self._publish_track_markers(per_person_thresholds, alert_info, rgb_msg.header.stamp)
+        self._publish_track_markers(per_person_thresholds, alert_info, rgb_msg.header.stamp, dynamic_threshold)
 
 
 def main():
