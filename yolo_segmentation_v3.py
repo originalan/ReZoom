@@ -53,12 +53,12 @@ from sensor_msgs.msg import CameraInfo
 
 from ultralytics import YOLO  # YOLOv8
 
-DETECTION_DISTANCE = 0.8  # m
-VEHICLE_SPEED_GAIN = 0.5   # m per m/s
-PERSON_SPEED_GAIN  = 0.5   # m per m/s of person radial speed
+DETECTION_DISTANCE = 1.2  # m
+VEHICLE_SPEED_GAIN = 0.3   # m per m/s
+PERSON_SPEED_GAIN  = 0.3   # m per m/s of person radial speed
 FRAME_SKIP = 2             # process every (N+1)th frame
 MAX_DISTANCE_JUMP = 1.75   # m (inter-frame distance gate)
-MAX_POSSIBLE_THRESHOLD_DISTANCE = 5.0  # m
+MAX_POSSIBLE_THRESHOLD_DISTANCE = 8.0  # m
 
 # Hazard levels (match supervisor)
 CLEAR, WARN, SLOW, STOP = 0, 1, 2, 3
@@ -73,6 +73,7 @@ class PersonDet:
     - dist:     robust range from depth (m)
     - mask:     boolean mask in image space (HxW)
     - X, Y:     metric coordinates in camera frame (m)
+    - conf:     YOLO confidence score (0-1)
     """
     cx: int
     cy: int
@@ -80,6 +81,7 @@ class PersonDet:
     mask: np.ndarray  # bool HxW
     X: float
     Y: float
+    conf: float
 
 @dataclass
 class OffenderInfo:
@@ -113,9 +115,9 @@ class AlertInfo:
 # ---------------- Small per-person track ----------------
 class Track:
     __slots__ = ("id","cx","cy","dist","filt_dist","prev_time","prev_for_speed",
-                 "radial","misses","xy","prev_xy","vxy","age")
+                 "radial","misses","xy","prev_xy","vxy","age", "conf")
 
-    def __init__(self, tid:int, cx:int, cy:int, dist:float, tstamp:float, xy:Tuple[float,float]):
+    def __init__(self, tid:int, cx:int, cy:int, dist:float, tstamp:float, xy:Tuple[float,float], conf:float=1.0):
         self.id = tid
         self.cx, self.cy = cx, cy
         self.dist = dist
@@ -128,9 +130,10 @@ class Track:
         self.prev_xy = None
         self.vxy = np.array([0.0, 0.0], dtype=float)
         self.age = 1  # frames this track has been matched
+        self.conf = conf
 
     def update(self, cx:int, cy:int, dist:float, tstamp:float, alpha:float,
-               xy:Tuple[float,float], dt_lo:float=0.02, dt_hi:float=0.5):
+               xy:Tuple[float,float], conf:float=1.0, dt_lo:float=0.02, dt_hi:float=0.5):
         self.dist = dist
         self.filt_dist = alpha*dist + (1.0-alpha)*self.filt_dist
         dt = tstamp - self.prev_time if self.prev_time is not None else None
@@ -149,6 +152,7 @@ class Track:
         self.xy = xy
         self.misses = 0
         self.age += 1  # one more successful association
+        self.conf = conf
 
 # ---------------- Main Node ----------------
 class YoloPeopleProximityNode:
@@ -176,8 +180,8 @@ class YoloPeopleProximityNode:
         self.marker_pub = rospy.Publisher("~people_markers", MarkerArray, queue_size=1)
 
         # FOV visualization (for RViz only)
-        self.fov_angle_deg = rospy.get_param("~fov_angle_deg", 93.0)  # total horizontal FOV
-        self.fov_range     = rospy.get_param("~fov_range", 5.0)       # how far to draw the FOV rays (m)
+        self.fov_angle_deg = rospy.get_param("~fov_angle_deg", 100.0)  # total horizontal FOV
+        self.fov_range     = rospy.get_param("~fov_range", 8.0)       # how far to draw the FOV rays (m)
 
         # --- camera intrinsics (px) ---
         self.fx = self.fy = self.cx0 = self.cy0 = None
@@ -191,9 +195,9 @@ class YoloPeopleProximityNode:
         self.min_vel_age   = rospy.get_param("~min_vel_age", 2)      # frames
 
         # horizon / gains for “crossing” risk
-        self.ttc_horizon = float(rospy.get_param("~ttc_horizon", 2.5))   # seconds
-        self.dca_limit   = float(rospy.get_param("~dca_limit",   2.7))   # m, distance at closest approach
-        self.perp_gain   = float(rospy.get_param("~perp_gain",   0.4))   # m of extra buffer per m/s of perpendicular rel speed
+        self.ttc_horizon = float(rospy.get_param("~ttc_horizon", 3.0))   # seconds
+        self.dca_limit   = float(rospy.get_param("~dca_limit",   2.75))   # m, distance at closest approach
+        self.perp_gain   = float(rospy.get_param("~perp_gain",   0.75))   # m of extra buffer per m/s of perpendicular rel speed
 
         # gates / smoothing
         self.max_dist_jump  = rospy.get_param("~max_dist_jump", MAX_DISTANCE_JUMP)  # m (for both single & multi)
@@ -245,6 +249,7 @@ class YoloPeopleProximityNode:
         self.ids_pub   = rospy.Publisher("~people_ids", Int32MultiArray, queue_size=1)
         self.dists_pub = rospy.Publisher("~people_distances", Float32MultiArray, queue_size=1)
         self.speeds_pub= rospy.Publisher("~people_radial_speeds", Float32MultiArray, queue_size=1)
+        self.confidence_pub = rospy.Publisher("~people_confidences", Float32MultiArray, queue_size=1)
 
         # ---------------- Subscribers w/ sync ----------------
         rospy.Subscriber(self.speed_topic, Odometry, self.odom_callback)
@@ -394,6 +399,29 @@ class YoloPeopleProximityNode:
             marker.lifetime = rospy.Duration(0.5)
 
             marray.markers.append(marker)
+
+            # Confidence text label (above sphere)
+            conf = float(getattr(tr, "conf", 1.0))
+            conf_pct = int(round(conf*100))
+            txt = Marker()
+            txt.header.stamp = stamp
+            txt.header.frame_id = self.marker_frame
+            txt.ns = "people_conf"
+            txt.id = tid
+            txt.type = Marker.TEXT_VIEW_FACING
+            txt.action = Marker.ADD
+            txt.pose.position.x = float(tr.xy[0])
+            txt.pose.position.y = float(tr.xy[1])
+            txt.pose.position.z = 0.5 # above the sphere
+            txt.pose.orientation.w = 1.0
+            txt.scale.z = 0.15  # text height
+            txt.text = "ID %d: %d%%" % (tid, conf_pct)
+            txt.color.r = 1.0
+            txt.color.g = 1.0
+            txt.color.b = 1.0
+            txt.color.a = 0.9
+            txt.lifetime = rospy.Duration(0.5)
+            marray.markers.append(txt)
 
         # ──────────────────────────────
         # 2) Velocity arrows
@@ -681,7 +709,7 @@ class YoloPeopleProximityNode:
         # Delete markers for tracks that no longer exist
         stale_ids = self._published_marker_ids - current_ids
         for tid in stale_ids:
-            for ns in ["people_tracks", "people_vel", "people_ttc", "people_threshold_rings", "people_ttc_ray"]:
+            for ns in ["people_tracks", "people_vel", "people_ttc", "people_threshold_rings", "people_ttc_ray", "people_conf"]:
                 m = Marker()
                 m.header.stamp = stamp
                 m.header.frame_id = self.marker_frame
@@ -896,6 +924,8 @@ class YoloPeopleProximityNode:
             # metric XY in camera frame
             X, Y = self._uvZ_to_xy(cx, cy, dist)
 
+            conf = float(box.conf[0]) if hasattr(box, "conf") and box.conf is not None else 1.0
+
             out.append(
                 PersonDet(
                     cx=int(cx),
@@ -904,15 +934,15 @@ class YoloPeopleProximityNode:
                     mask=m,
                     X=float(X),
                     Y=float(Y),
+                    conf=conf,
                 )
             )
 
         return out
 
-
-    def _associate(self, dets: List[Tuple[int,int,float,float,float]], tstamp: float):
+    def _associate(self, dets: List[Tuple[int,int,float,float,float,float]], tstamp: float):
         """
-        det = (cx, cy, dist, X, Y). Gate and cost primarily in metric XY (meters) + range.
+        det = (cx, cy, dist, X, Y, conf). Gate and cost primarily in metric XY (meters) + range.
         Greedy nearest-neighbor association between current tracks and detections.
             Gates: pixel jump & distance jump.
         """
@@ -924,7 +954,7 @@ class YoloPeopleProximityNode:
         ASSOC_DEPTH_WEIGHT = 1.0  # for dd
 
         def cost(tr: Track, det):
-            _, _, d, X, Y = det
+            _, _, d, X, Y, _ = det
             dXY = math.hypot(tr.xy[0] - X, tr.xy[1] - Y)
             dd  = abs(tr.dist - d)
             return ASSOC_XY_WEIGHT * dXY + ASSOC_DEPTH_WEIGHT * min(dd, 1.0)
@@ -935,7 +965,7 @@ class YoloPeopleProximityNode:
             for tid in list(unmatched_tracks):
                 tr = self.tracks[tid]
                 for j in list(unmatched_dets):
-                    cx, cy, d, X, Y = dets[j]
+                    cx, cy, d, X, Y, conf = dets[j]
                     # gates in metric space
                     dXY = math.hypot(tr.xy[0] - X, tr.xy[1] - Y)
                     if dXY > self.assoc_xy_gate:
@@ -956,15 +986,15 @@ class YoloPeopleProximityNode:
         # update matched
         for tid, j in matches:
             tr = self.tracks[tid]
-            cx, cy, d, X, Y = dets[j]
-            tr.update(cx, cy, d, tstamp, alpha=self.filter_alpha, xy=(X, Y))
+            cx, cy, d, X, Y, conf = dets[j]
+            tr.update(cx, cy, d, tstamp, alpha=self.filter_alpha, xy=(X, Y), conf=conf)
 
         # new tracks
         for j in list(unmatched_dets):
-            cx, cy, d, X, Y = dets[j]
+            cx, cy, d, X, Y, conf = dets[j]
             tid = self.next_tid
             self.next_tid += 1
-            self.tracks[tid] = Track(tid, cx, cy, d, tstamp, xy=(X, Y))
+            self.tracks[tid] = Track(tid, cx, cy, d, tstamp, xy=(X, Y), conf=conf)
 
         # age out unmatched
         to_delete = []
@@ -1131,7 +1161,7 @@ class YoloPeopleProximityNode:
 
             X_base, Y_base = self._camera_to_base_xy(X_cam, Y_cam, Z_cam, stamp)
 
-            dets.append((p.cx, p.cy, p.dist, X_base, Y_base))
+            dets.append((p.cx, p.cy, p.dist, X_base, Y_base, p.conf))
 
         self._associate(dets, tstamp)
 
@@ -1369,7 +1399,7 @@ class YoloPeopleProximityNode:
         self._update_tracks_from_people(people, now)
 
         # 8) Build and publish arrays (IDs, distances, radial speeds)
-        ids, dists, speeds = [], [], []
+        ids, dists, speeds, confidences = [], [], [], []
         closest_dist = None
         best_approach = 0.0
 
@@ -1378,6 +1408,7 @@ class YoloPeopleProximityNode:
             dists.append(float(tr.filt_dist))
             spd = float("nan") if tr.radial is None else float(tr.radial)
             speeds.append(spd)
+            confidences.append(float(getattr(tr, "conf", 1.0)))
             if tr.radial is not None and tr.radial > best_approach:
                 best_approach = tr.radial
             if closest_dist is None or tr.filt_dist < closest_dist:
@@ -1386,6 +1417,7 @@ class YoloPeopleProximityNode:
         self.ids_pub.publish(Int32MultiArray(data=ids))
         self.dists_pub.publish(Float32MultiArray(data=dists))
         self.speeds_pub.publish(Float32MultiArray(data=speeds))
+        self.confidence_pub.publish(Float32MultiArray(data=confidences))
 
         # Still publish closest distance for compatibility
         if closest_dist is not None and np.isfinite(closest_dist):
