@@ -180,7 +180,7 @@ class YoloPeopleProximityNode:
         self.marker_pub = rospy.Publisher("~people_markers", MarkerArray, queue_size=1)
 
         # FOV visualization (for RViz only)
-        self.fov_angle_deg = rospy.get_param("~fov_angle_deg", 100.0)  # total horizontal FOV
+        self.fov_angle_deg = rospy.get_param("~fov_angle_deg", 98.0)  # total horizontal FOV
         self.fov_range     = rospy.get_param("~fov_range", 8.0)       # how far to draw the FOV rays (m)
 
         # --- camera intrinsics (px) ---
@@ -195,9 +195,9 @@ class YoloPeopleProximityNode:
         self.min_vel_age   = rospy.get_param("~min_vel_age", 2)      # frames
 
         # horizon / gains for “crossing” risk
-        self.ttc_horizon = float(rospy.get_param("~ttc_horizon", 3.0))   # seconds
-        self.dca_limit   = float(rospy.get_param("~dca_limit",   2.75))   # m, distance at closest approach
-        self.perp_gain   = float(rospy.get_param("~perp_gain",   0.75))   # m of extra buffer per m/s of perpendicular rel speed
+        self.ttc_horizon = float(rospy.get_param("~ttc_horizon", 2.5))   # seconds
+        self.dca_limit   = float(rospy.get_param("~dca_limit",   3.0))   # m, distance at closest approach
+        self.perp_gain   = float(rospy.get_param("~perp_gain",   0.7))   # m of extra buffer per m/s of perpendicular rel speed
 
         # gates / smoothing
         self.max_dist_jump  = rospy.get_param("~max_dist_jump", MAX_DISTANCE_JUMP)  # m (for both single & multi)
@@ -206,6 +206,7 @@ class YoloPeopleProximityNode:
         self.max_threshold  = rospy.get_param("~max_threshold", MAX_POSSIBLE_THRESHOLD_DISTANCE)
 
         self.min_cross_speed = rospy.get_param("~min_cross_speed", 0.15)  # m/s
+        self.min_lateral_fraction = rospy.get_param("~min_lateral_fraction", 0.5)  # min fraction of speed that is lateral to consider for crossing risk
 
         self._published_marker_ids = set()
 
@@ -414,7 +415,7 @@ class YoloPeopleProximityNode:
             txt.pose.position.y = float(tr.xy[1])
             txt.pose.position.z = 0.5 # above the sphere
             txt.pose.orientation.w = 1.0
-            txt.scale.z = 0.15  # text height
+            txt.scale.z = 0.3  # text height
             txt.text = "ID %d: %d%%" % (tid, conf_pct)
             txt.color.r = 1.0
             txt.color.g = 1.0
@@ -731,9 +732,9 @@ class YoloPeopleProximityNode:
         0 CLEAR, 1 WARN, 2 SLOW, 3 STOP
         """
         # Tunable params
-        warn_margin = float(rospy.get_param("~haz_warn_margin", 0.5))   # m
-        slow_margin = float(rospy.get_param("~haz_slow_margin", 0.2))  # m
-        stop_margin = float(rospy.get_param("~haz_stop_margin", -0.1))  # m
+        warn_margin = float(rospy.get_param("~haz_warn_margin", 0.75))   # m
+        slow_margin = float(rospy.get_param("~haz_slow_margin", 0.5))  # m
+        stop_margin = float(rospy.get_param("~haz_stop_margin", 0.0))  # m
 
         stop_ttc = float(rospy.get_param("~haz_stop_ttc", 1.0))          # s
         stop_dca = float(rospy.get_param("~haz_stop_dca", 0.8))          # m
@@ -1181,20 +1182,28 @@ class YoloPeopleProximityNode:
             if tr.radial is not None and np.isfinite(tr.radial) and tr.radial > 0.0:
                 thr = min(thr + self.person_speed_gain * tr.radial, self.max_threshold)
 
-            # 2) Crossing risk using full XY velocity (perpendicular-ish motion)
+            # 2) Crossing risk using full XY velocity (perpendicular-ish motion) (key is small v_perp vs large v_perp)
             r = np.array(tr.xy, dtype=float) if tr.xy is not None else None
             v = tr.vxy
 
             if r is not None and v is not None:
                 if np.isfinite(r).all() and np.isfinite(v).all():
+                    r_norm = float(np.linalg.norm(r))
                     speed_norm = float(np.linalg.norm(v))
 
-                    # Ignore essentially static people
-                    if speed_norm >= self.min_cross_speed:
-                        t_star, d_star = self._closest_approach(r, v)
+                    if (r_norm > 1e-6 and speed_norm > 1e-6):
+                        r_hat = r/r_norm
+                        v_radial = np.dot(v, r_hat) # scalar value (+ = away, - = toward)
+                        v_perp = v - v_radial * r_hat
+                        v_perp_norm = float(np.linalg.norm(v_perp))
+                        lateral_fraction = v_perp_norm / speed_norm
+                    else:
+                        v_perp_norm = 0.0
+                        lateral_fraction = 0.0
 
-                        # Are they going to get significantly closer than they are now?
-                        current_dist = float(tr.filt_dist)
+                    # only consider crossing if there is significant lateral motion
+                    if v_perp_norm >= self.min_cross_speed and lateral_fraction >= self.min_lateral_fraction:
+                        t_star, d_star = self._closest_approach(r, v)
 
                         crossing = (
                             (t_star >= 0.0) and
@@ -1204,19 +1213,20 @@ class YoloPeopleProximityNode:
 
                         rospy.loginfo_throttle(
                             0.5,
-                            "[cross] ID %d: dist=%.2f thr=%.2f |v|=%.2f "
-                            "t*=%.2f d*=%.2f crossing=%s",
+                            "[cross] ID %d: dist=%.2f thr=%.2f |v_perp|=%.2f "
+                            "lat_frac=%.2f t*=%.2f d*=%.2f crossing=%s",
                             tid,
-                            current_dist,
+                            float(tr.filt_dist) if tr.filt_dist is not None else float(tr.dist),
                             thr,
-                            speed_norm,
+                            v_perp_norm,
+                            lateral_fraction,
                             t_star,
                             d_star,
                             str(crossing),
                         )
 
                         if crossing:
-                            thr = min(thr + self.perp_gain * speed_norm, self.max_threshold)
+                            thr = min(thr + self.perp_gain * v_perp_norm, self.max_threshold)
 
             per_person_thresholds[tid] = thr
 
