@@ -198,6 +198,8 @@ class YoloPeopleProximityNode:
         self.ttc_horizon = float(rospy.get_param("~ttc_horizon", 2.5))   # seconds
         self.dca_limit   = float(rospy.get_param("~dca_limit",   3.0))   # m, distance at closest approach
         self.perp_gain   = float(rospy.get_param("~perp_gain",   0.7))   # m of extra buffer per m/s of perpendicular rel speed
+        self.cross_x_max = float(rospy.get_param("~cross_x_max", 3.0))   # m, max forward distance where a lateral crossing matters
+        self.cross_y_min = float(rospy.get_param("~cross_y_min", 0.20))  # m, ignore tiny lateral offsets near centerline
 
         # gates / smoothing
         self.max_dist_jump  = rospy.get_param("~max_dist_jump", MAX_DISTANCE_JUMP)  # m (for both single & multi)
@@ -1171,7 +1173,7 @@ class YoloPeopleProximityNode:
         """
         Compute per-track thresholds, inflating base dynamic threshold by:
           - approaching radial speed
-          - crossing risk in base_link XY plane within TTC horizon and DCA limit.
+          - lateral path-crossing risk in base_link XY plane within TTC horizon.
         """
         per_person_thresholds: Dict[int, float] = {}
 
@@ -1182,51 +1184,45 @@ class YoloPeopleProximityNode:
             if tr.radial is not None and np.isfinite(tr.radial) and tr.radial > 0.0:
                 thr = min(thr + self.person_speed_gain * tr.radial, self.max_threshold)
 
-            # 2) Crossing risk using full XY velocity (perpendicular-ish motion) (key is small v_perp vs large v_perp)
+            # 2) Crossing risk (direct lateral-crossing test in base_link)
+            # base_link convention: x forward, y left. A "path crossing" occurs if y(t) crosses 0 soon
+            # while the person is in front (x(t)>0) and close enough ahead (x(t) <= cross_x_max).
             r = np.array(tr.xy, dtype=float) if tr.xy is not None else None
             v = tr.vxy
 
-            if r is not None and v is not None:
-                if np.isfinite(r).all() and np.isfinite(v).all():
-                    r_norm = float(np.linalg.norm(r))
-                    speed_norm = float(np.linalg.norm(v))
+            if r is not None and v is not None and np.isfinite(r).all() and np.isfinite(v).all():
+                x0 = float(r[0])
+                y0 = float(r[1])
+                vx = float(v[0])
+                vy = float(v[1])
 
-                    if (r_norm > 1e-6 and speed_norm > 1e-6):
-                        r_hat = r/r_norm
-                        v_radial = np.dot(v, r_hat) # scalar value (+ = away, - = toward)
-                        v_perp = v - v_radial * r_hat
-                        v_perp_norm = float(np.linalg.norm(v_perp))
-                        lateral_fraction = v_perp_norm / speed_norm
-                    else:
-                        v_perp_norm = 0.0
-                        lateral_fraction = 0.0
+                crossing = False
+                t_cross = float("nan")
+                x_cross = float("nan")
 
-                    # only consider crossing if there is significant lateral motion
-                    if v_perp_norm >= self.min_cross_speed and lateral_fraction >= self.min_lateral_fraction:
-                        t_star, d_star = self._closest_approach(r, v)
+                if abs(y0) >= float(self.cross_y_min) and abs(vy) > 1e-3:
+                    t_cross = -y0 / vy
+                    if 0.0 <= t_cross <= float(self.ttc_horizon):
+                        x_cross = x0 + vx * t_cross
+                        # Only care if this crossing happens in front, and not too far ahead.
+                        if (x_cross > 0.0) and (x_cross <= float(self.cross_x_max)) and (abs(vy) >= float(self.min_cross_speed)):
+                            crossing = True
 
-                        crossing = (
-                            (t_star >= 0.0) and
-                            (t_star <= self.ttc_horizon) and
-                            (d_star <= self.dca_limit)
-                        )
+                rospy.loginfo_throttle(
+                    0.5,
+                    "[cross_lat] ID %d: dist=%.2f thr=%.2f y0=%.2f vy=%.2f t_cross=%s x_cross=%s crossing=%s",
+                    tid,
+                    float(tr.filt_dist) if tr.filt_dist is not None else float(tr.dist),
+                    thr,
+                    y0,
+                    vy,
+                    ("NA" if not np.isfinite(t_cross) else f"{t_cross:.2f}"),
+                    ("NA" if not np.isfinite(x_cross) else f"{x_cross:.2f}"),
+                    str(crossing),
+                )
 
-                        rospy.loginfo_throttle(
-                            0.5,
-                            "[cross] ID %d: dist=%.2f thr=%.2f |v_perp|=%.2f "
-                            "lat_frac=%.2f t*=%.2f d*=%.2f crossing=%s",
-                            tid,
-                            float(tr.filt_dist) if tr.filt_dist is not None else float(tr.dist),
-                            thr,
-                            v_perp_norm,
-                            lateral_fraction,
-                            t_star,
-                            d_star,
-                            str(crossing),
-                        )
-
-                        if crossing:
-                            thr = min(thr + self.perp_gain * v_perp_norm, self.max_threshold)
+                if crossing:
+                    thr = min(thr + self.perp_gain * abs(vy), self.max_threshold)
 
             per_person_thresholds[tid] = thr
 
