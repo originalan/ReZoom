@@ -8,7 +8,6 @@
 #   ~max_dist_jump — meters allowed between frames for same person; tighten if IDs switch when people cross.
 #   ~max_misses — how many frames a person can disappear (occlusion) before we drop the track.
 #   ~filter_alpha — higher = more responsive, lower = smoother speeds. 
-#   ~ttc_horizon, ~dca_limit — crossing risk parameters. Nudge ttc_horizon up (e.g. 2.0 → 3.0 s) and/or dca_limit up (0.8 → 1.0 m) to catch more crossers.
 #   ~assoc_xy_gate — max lateral distance (m) for associating detections to tracks. Lower to reduce ID switches when people cross.
 #   ~min_alert_age — min frames before a track can raise an alert. Increase to reduce false alarms on spurious tracks.
 #   ~min_vel_age — min frames before a track shows velocity arrows. Increase to avoid showing arrows for shaky tracks.
@@ -196,10 +195,9 @@ class YoloPeopleProximityNode:
 
         # horizon / gains for “crossing” risk
         self.ttc_horizon = float(rospy.get_param("~ttc_horizon", 2.5))   # seconds
-        self.dca_limit   = float(rospy.get_param("~dca_limit",   3.0))   # m, distance at closest approach
         self.perp_gain   = float(rospy.get_param("~perp_gain",   0.7))   # m of extra buffer per m/s of perpendicular rel speed
-        self.cross_x_max = float(rospy.get_param("~cross_x_max", 3.0))   # m, max forward distance where a lateral crossing matters
-        self.cross_y_min = float(rospy.get_param("~cross_y_min", 0.20))  # m, ignore tiny lateral offsets near centerline
+        self.cross_x_max = float(rospy.get_param("~cross_x_max", 3.5))   # m, max forward distance where a lateral crossing matters
+        self.cross_y_min = float(rospy.get_param("~cross_y_min", 0.10))  # m, ignore tiny lateral offsets near centerline
 
         # gates / smoothing
         self.max_dist_jump  = rospy.get_param("~max_dist_jump", MAX_DISTANCE_JUMP)  # m (for both single & multi)
