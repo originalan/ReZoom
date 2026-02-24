@@ -69,20 +69,20 @@ class CmdVelSafetySupervisor:
         self.max_angular = float(rospy.get_param("~max_angular", 10.0))     # rad/s
 
         # ---------------- SLOW/STOP tuning ----------------
-        self.slow_scale = float(rospy.get_param("~slow_scale", 0.4))
+        self.slow_scale = float(rospy.get_param("~slow_scale", 0.5))
         self.warn_scale = float(rospy.get_param("~warn_scale", 0.75))  # optional gentle slow in WARN
         self.use_warn_scale = bool(rospy.get_param("~use_warn_scale", False))
 
-        self.stop_hold_s = float(rospy.get_param("~stop_hold_s", 0.8))
+        self.stop_hold_s = float(rospy.get_param("~stop_hold_s", 0.5))  # how long to hold STOP after triggered (even if hazard clears)
         self.clear_frames_to_release = int(rospy.get_param("~clear_frames_to_release", 5))
 
         # If hazard_level is not published, you can infer from margin/ttc/dca (optional)
         self.enable_infer_from_metrics = bool(rospy.get_param("~enable_infer_from_metrics", False))
 
         # Inference thresholds (only used if enable_infer_from_metrics=True)
-        self.warn_margin = float(rospy.get_param("~warn_margin", 0.25))   # meters
-        self.slow_margin = float(rospy.get_param("~slow_margin", -0.10))  # meters
-        self.stop_margin = float(rospy.get_param("~stop_margin", -0.30))  # meters
+        self.warn_margin = float(rospy.get_param("~warn_margin", 0.75))   # meters
+        self.slow_margin = float(rospy.get_param("~slow_margin", 0.5))  # meters
+        self.stop_margin = float(rospy.get_param("~stop_margin", 0.0))  # meters
         self.stop_ttc = float(rospy.get_param("~stop_ttc", 1.0))          # seconds
         self.stop_dca = float(rospy.get_param("~stop_dca", 0.8))          # meters
 
@@ -171,9 +171,9 @@ class CmdVelSafetySupervisor:
         # STOP conditions
         if self.margin <= self.stop_margin:
             return STOP
-        if math.isfinite(self.ttc) and math.isfinite(self.dca):
-            if (0.0 <= self.ttc <= self.stop_ttc) and (self.dca <= self.stop_dca):
-                return STOP
+        # if math.isfinite(self.ttc) and math.isfinite(self.dca):
+        #     if (0.0 <= self.ttc <= self.stop_ttc) and (self.dca <= self.stop_dca):
+        #         return STOP
 
         # SLOW/WARN/CLEAR
         if self.margin <= self.slow_margin:
@@ -278,6 +278,7 @@ class CmdVelSafetySupervisor:
 
         # Ramp
         out = self._apply_ramp(target, dt)
+        # out = target
 
         # Publish heartbeat
         self.pub.publish(out)
