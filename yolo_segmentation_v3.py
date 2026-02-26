@@ -197,7 +197,7 @@ class YoloPeopleProximityNode:
         self.ttc_horizon = float(rospy.get_param("~ttc_horizon", 2.5))   # seconds
         self.perp_gain   = float(rospy.get_param("~perp_gain",   0.7))   # m of extra buffer per m/s of perpendicular rel speed
         self.cross_x_max = float(rospy.get_param("~cross_x_max", 3.5))   # m, max forward distance where a lateral crossing matters
-        self.cross_y_min = float(rospy.get_param("~cross_y_min", 0.10))  # m, ignore tiny lateral offsets near centerline
+        self.cross_y_min = float(rospy.get_param("~cross_y_min", 0.15))  # m, ignore tiny lateral offsets near centerline
 
         # gates / smoothing
         self.max_dist_jump  = rospy.get_param("~max_dist_jump", MAX_DISTANCE_JUMP)  # m (for both single & multi)
@@ -205,7 +205,7 @@ class YoloPeopleProximityNode:
         self.filter_alpha   = rospy.get_param("~filter_alpha", 0.3)                # EMA for distances
         self.max_threshold  = rospy.get_param("~max_threshold", MAX_POSSIBLE_THRESHOLD_DISTANCE)
 
-        self.min_cross_speed = rospy.get_param("~min_cross_speed", 0.15)  # m/s
+        self.min_cross_speed = rospy.get_param("~min_cross_speed", 0.20)  # m/s
         self.min_lateral_fraction = rospy.get_param("~min_lateral_fraction", 0.5)  # min fraction of speed that is lateral to consider for crossing risk
 
         self._published_marker_ids = set()
@@ -792,7 +792,7 @@ class YoloPeopleProximityNode:
         except (tf2_ros.LookupException, tf2_ros.ExtrapolationException) as e:
             rospy.logwarn_throttle(1.0, "TF transform %s -> %s failed: %s",
                                    self.camera_frame, self.base_frame, str(e))
-            return 0.0, 0.0
+            return None
         # In base_link, we now expect:
         #   x ≈ forward, y ≈ left, z ≈ up
         return float(pt_base.point.x), float(pt_base.point.y)
@@ -1160,7 +1160,10 @@ class YoloPeopleProximityNode:
             Y_cam = p.Y
             Z_cam = p.dist
 
-            X_base, Y_base = self._camera_to_base_xy(X_cam, Y_cam, Z_cam, stamp)
+            xy = self._camera_to_base_xy(X_cam, Y_cam, Z_cam, stamp)
+            if xy is None:
+                continue
+            X_base, Y_base = xy
 
             dets.append((p.cx, p.cy, p.dist, X_base, Y_base, p.conf))
 
@@ -1198,22 +1201,34 @@ class YoloPeopleProximityNode:
                 t_cross = float("nan")
                 x_cross = float("nan")
 
-                if abs(y0) >= float(self.cross_y_min) and abs(vy) > 1e-3:
+                vnorm = math.hypot(vx, vy)
+                lateral_frac = abs(vy) / max(vnorm, 1e-6)
+
+                # must be moving toward y=0, and be "mostly lateral" enough
+                moving_toward_center = (y0 * vy) < 0.0
+
+                if (abs(y0) >= self.cross_y_min and
+                    abs(vy) > 1e-3 and
+                    moving_toward_center and
+                    lateral_frac >= self.min_lateral_fraction and
+                    abs(vy) >= self.min_cross_speed):
+
                     t_cross = -y0 / vy
-                    if 0.0 <= t_cross <= float(self.ttc_horizon):
+                    if 0.0 <= t_cross <= self.ttc_horizon:
                         x_cross = x0 + vx * t_cross
-                        # Only care if this crossing happens in front, and not too far ahead.
-                        if (x_cross > 0.0) and (x_cross <= float(self.cross_x_max)) and (abs(vy) >= float(self.min_cross_speed)):
+                        if (x_cross > 0.0) and (x_cross <= self.cross_x_max):
                             crossing = True
 
                 rospy.loginfo_throttle(
                     0.5,
-                    "[cross_lat] ID %d: dist=%.2f thr=%.2f y0=%.2f vy=%.2f t_cross=%s x_cross=%s crossing=%s",
+                    "[cross_lat] ID %d: dist=%.2f thr=%.2f y0=%.2f vy=%.2f vnorm=%s lat_frac=%s t_cross=%s x_cross=%s crossing=%s",
                     tid,
                     float(tr.filt_dist) if tr.filt_dist is not None else float(tr.dist),
                     thr,
                     y0,
                     vy,
+                    ("NA" if not np.isfinite(vnorm) else f"{vnorm:.2f}"),
+                    ("NA" if not np.isfinite(lateral_frac) else f"{lateral_frac:.2f}"),
                     ("NA" if not np.isfinite(t_cross) else f"{t_cross:.2f}"),
                     ("NA" if not np.isfinite(x_cross) else f"{x_cross:.2f}"),
                     str(crossing),
