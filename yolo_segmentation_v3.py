@@ -772,45 +772,41 @@ class YoloPeopleProximityNode:
 
         return CLEAR
 
-    def _camera_to_base_xy(self, X_cam: float, Y_cam: float, Z_cam: float,
-                           stamp: rospy.Time) -> Tuple[float, float]:
+    def _camera_optical_xyz_to_base_xy(
+        self,
+        Xo: float, Yo: float, Zo: float,
+        stamp: rospy.Time
+    ) -> Optional[Tuple[float, float]]:
         """
-        Transform a 3D point from camera frame to base_link frame, return (x, y) in base_link.
-
-        X_cam, Y_cam, Z_cam: coordinates in camera frame (meters)
-        stamp: timestamp to use for TF lookup
+        Transform a 3D point in camera optical frame -> base_link, return (x,y) in base_link.
+        Returns None if TF fails (do NOT fallback to (0,0)).
         """
-        pt_cam = PointStamped()
-        pt_cam.header.stamp = stamp
-        pt_cam.header.frame_id = self.camera_frame # <- now the optical frame
-        pt_cam.point.x = X_cam
-        pt_cam.point.y = Y_cam
-        pt_cam.point.z = Z_cam
+        pt = PointStamped()
+        pt.header.stamp = stamp
+        pt.header.frame_id = self.camera_frame  # must be the optical frame
+        pt.point.x = float(Xo)
+        pt.point.y = float(Yo)
+        pt.point.z = float(Zo)
 
         try:
-            pt_base = self.tf_buffer.transform(pt_cam, self.base_frame, timeout=rospy.Duration(0.05))
-        except (tf2_ros.LookupException, tf2_ros.ExtrapolationException) as e:
-            rospy.logwarn_throttle(1.0, "TF transform %s -> %s failed: %s",
-                                   self.camera_frame, self.base_frame, str(e))
+            pt_base = self.tf_buffer.transform(pt, self.base_frame, timeout=rospy.Duration(0.05))
+        except (tf2_ros.LookupException, tf2_ros.ExtrapolationException, tf2_ros.ConnectivityException) as e:
+            rospy.logwarn_throttle(1.0, "TF %s->%s failed: %s", self.camera_frame, self.base_frame, str(e))
             return None
-        # In base_link, we now expect:
-        #   x ≈ forward, y ≈ left, z ≈ up
+
         return float(pt_base.point.x), float(pt_base.point.y)
 
-
-    def _uvZ_to_xy(self, u:int, v:int, Z:float) -> Tuple[float,float]:
+    def _uvZ_to_xyz_optical(self, u: int, v: int, Z: float) -> Tuple[float, float, float]:
         """
-        Back-project pixel (u,v) with depth Z (meters) to camera XY on ground plane.
-        Assumes pinhole model; for a level camera you can treat (x,y) as forward/right or vice versa.
-        Here: x = right, y = down-camera; you can remap later if needed.
+        Back-project pixel (u,v) with depth Z (meters) into the CAMERA OPTICAL frame.
+        Optical frame convention: X right, Y down, Z forward.
         """
-        if self.fx is None or self.fy is None or self.cx0 is None or self.cy0 is None:
-            # Shouldn't happen if caminfo_ready is True, but be safe
-            return 0.0, 0.0
-        x = (u - self.cx0) * Z / self.fx
-        y = (v - self.cy0) * Z / self.fy
-        return float(x), float(y)
+        if not self.caminfo_ready:
+            return 0.0, 0.0, 0.0
 
+        X = (float(u) - self.cx0) * float(Z) / self.fx
+        Y = (float(v) - self.cy0) * float(Z) / self.fy
+        return float(X), float(Y), float(Z)
 
     def _closest_approach(self, r:np.ndarray, v:np.ndarray) -> Tuple[float,float]:
         """
@@ -923,18 +919,17 @@ class YoloPeopleProximityNode:
             cx, cy = c
 
             # metric XY in camera frame
-            X, Y = self._uvZ_to_xy(cx, cy, dist)
-
             conf = float(box.conf[0]) if hasattr(box, "conf") and box.conf is not None else 1.0
 
+            Xo, Yo, Zo = self._uvZ_to_xyz_optical(cx, cy, dist)  # dist is Z
             out.append(
                 PersonDet(
                     cx=int(cx),
                     cy=int(cy),
-                    dist=float(dist),
+                    dist=float(Zo),   # Z forward
                     mask=m,
-                    X=float(X),
-                    Y=float(Y),
+                    X=float(Xo),      # optical X
+                    Y=float(Yo),      # optical Y
                     conf=conf,
                 )
             )
@@ -1146,28 +1141,20 @@ class YoloPeopleProximityNode:
                 dynamic_threshold
             )
 
-    def _update_tracks_from_people(self, people: List[PersonDet], tstamp: float):
-        """Build metric dets from PersonDet list and run association in base_link frame."""
+    def _update_tracks_from_people(self, people: List[PersonDet], stamp: rospy.Time):
+        """
+        Build base_link detections from PersonDet list using proper optical 3D + TF.
+        """
         dets = []
-
-        # Convert each detection's camera coords -> base_link coords
-        stamp = rospy.Time.from_sec(tstamp)  # same as rgb_msg.header.stamp but float->Time
-
         for p in people:
-            # We know p.dist is roughly the range; we treat camera projection as:
-            #   (X_cam, Y_cam, Z_cam) with Z_cam ≈ p.dist (forward)
-            X_cam = p.X
-            Y_cam = p.Y
-            Z_cam = p.dist
-
-            xy = self._camera_to_base_xy(X_cam, Y_cam, Z_cam, stamp)
+            # PersonDet.X,Y are optical X,Y; PersonDet.dist is optical Z
+            xy = self._camera_optical_xyz_to_base_xy(p.X, p.Y, p.dist, stamp)
             if xy is None:
                 continue
-            X_base, Y_base = xy
-
-            dets.append((p.cx, p.cy, p.dist, X_base, Y_base, p.conf))
-
-        self._associate(dets, tstamp)
+            xb, yb = xy
+            dets.append((p.cx, p.cy, p.dist, xb, yb, p.conf))  # note: store Z in det[2], base x,y in det[3:5]
+        tstamp_sec = stamp.to_sec()
+        self._associate(dets, tstamp_sec)
 
 
     def _compute_per_person_thresholds(self, dynamic_threshold: float) -> Dict[int, float]:
@@ -1415,7 +1402,8 @@ class YoloPeopleProximityNode:
             return
 
         # 7) Update multi-person tracks from current detections
-        self._update_tracks_from_people(people, now)
+        stamp = rgb_msg.header.stamp
+        self._update_tracks_from_people(people, stamp)
 
         # 8) Build and publish arrays (IDs, distances, radial speeds)
         ids, dists, speeds, confidences = [], [], [], []
