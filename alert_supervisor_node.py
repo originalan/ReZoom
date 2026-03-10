@@ -18,8 +18,10 @@ Behavior:
   - SLOW: scales linear & angular
   - STOP: outputs zero, holds STOP for stop_hold_s
   - If cmd_vel stale or hazard stale: STOP (fail-safe)
-  - Ramps outputs with accel/decel limits to avoid jerks
   - Optional hysteresis: require N consecutive CLEAR frames to fully release after STOP/SLOW
+
+
+  SOMETHING TO NOTE: This node affects both LINEAR and STEERING movement. Could possibly remove slowed steering? Need to test
 """
 
 import math
@@ -59,6 +61,10 @@ class CmdVelSafetySupervisor:
             "~dca_topic", "/yolo_people_proximity/hazard_dca"
         )
 
+        self.fail_open_if_no_hazard = bool(
+            rospy.get_param("~fail_open_if_no_hazard", False)
+        )
+
         # ---------------- Timing ----------------
         self.rate_hz = float(rospy.get_param("~rate_hz", 30.0))
         self.cmd_timeout = float(rospy.get_param("~cmd_timeout", 0.25))
@@ -85,11 +91,6 @@ class CmdVelSafetySupervisor:
         self.stop_margin = float(rospy.get_param("~stop_margin", 0.0))  # meters
         self.stop_ttc = float(rospy.get_param("~stop_ttc", 1.0))          # seconds
         self.stop_dca = float(rospy.get_param("~stop_dca", 0.8))          # meters
-
-        # ---------------- Ramping (smooth control) ----------------
-        self.max_accel = float(rospy.get_param("~max_accel", 1.0))        # m/s^2
-        self.max_decel = float(rospy.get_param("~max_decel", 2.5))        # m/s^2
-        self.max_ang_accel = float(rospy.get_param("~max_ang_accel", 2.5))# rad/s^2
 
         # ---------------- State ----------------
         self.latest_cmd = Twist()
@@ -182,26 +183,6 @@ class CmdVelSafetySupervisor:
             return WARN
         return CLEAR
 
-    def _apply_ramp(self, target: Twist, dt: float) -> Twist:
-        """Limit accel/decel to avoid jerk."""
-        out = Twist()
-
-        # Linear x ramp
-        v_prev = self.last_out.linear.x
-        v_tgt = target.linear.x
-        dv = v_tgt - v_prev
-        dv_max = (self.max_accel if dv >= 0.0 else self.max_decel) * dt
-        out.linear.x = v_prev + clamp(dv, -dv_max, dv_max)
-
-        # Angular z ramp
-        w_prev = self.last_out.angular.z
-        w_tgt = target.angular.z
-        dw = w_tgt - w_prev
-        dw_max = self.max_ang_accel * dt
-        out.angular.z = w_prev + clamp(dw, -dw_max, dw_max)
-
-        return out
-
     # ---------------- Main step ----------------
     def step(self, dt: float):
         now = rospy.Time.now()
@@ -231,9 +212,20 @@ class CmdVelSafetySupervisor:
         if level is None and (not alert_stale):
             level = STOP if self.alert_bool else CLEAR
 
-        # 4) Else fail-safe
+        # 4) Else choose fail-open or fail-safe
         if level is None:
-            level = STOP
+            if self.fail_open_if_no_hazard:
+                level = CLEAR
+                rospy.logwarn_throttle(
+                    1.0,
+                    "[safety] No fresh hazard input; fail-open enabled, passing through cmd_vel"
+                )
+            else:
+                level = STOP
+                rospy.logwarn_throttle(
+                    1.0,
+                    "[safety] No fresh hazard input; fail-safe STOP"
+                )
 
         # STOP hold
         if level == STOP:
@@ -276,9 +268,9 @@ class CmdVelSafetySupervisor:
         target.linear.x = clamp(target.linear.x, -self.max_linear, self.max_linear)
         target.angular.z = clamp(target.angular.z, -self.max_angular, self.max_angular)
 
-        # Ramp
-        out = self._apply_ramp(target, dt)
-        # out = target
+        # Ramp (maybe remove? Does escooter already have this?)
+        # out = self._apply_ramp(target, dt)
+        out = target
 
         # Publish heartbeat
         self.pub.publish(out)
